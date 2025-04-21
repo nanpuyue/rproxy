@@ -38,10 +38,6 @@ impl FromStr for Listen {
     }
 }
 
-fn error<E: Error + 'static>(e: E) {
-    println!("{e}");
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -55,23 +51,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         let (mut tcpstream, addr) = listener.accept().await?;
         tokio::spawn(async move {
-            let orig_dst = SockaddrIn::from(getsockopt(&tcpstream, OriginalDst).map_err(error)?);
-            let tcpsocket = TcpSocket::new_v4().map_err(error)?;
-            if let Some(x) = mark {
-                setsockopt(&tcpsocket, Mark, &x).map_err(error)?;
+            let orig_dst = match getsockopt(&tcpstream, OriginalDst) {
+                Ok(x) => SockaddrIn::from(x),
+                Err(e) => {
+                    println!("{addr} -> failed to get the original destination: {e}");
+                    return;
+                }
+            };
+
+            let upstream = async {
+                let tcpsocket = TcpSocket::new_v4()?;
+                if let Some(x) = mark {
+                    setsockopt(&tcpsocket, Mark, &x)?;
+                }
+                tcpsocket
+                    .connect((orig_dst.ip(), orig_dst.port()).into())
+                    .await
             }
+            .await;
 
-            let mut upstream = tcpsocket
-                .connect((orig_dst.ip(), orig_dst.port()).into())
-                .await
-                .map_err(error)?;
-            println!("{addr} -> {orig_dst} connected");
-            copy_bidirectional(&mut tcpstream, &mut upstream)
-                .await
-                .map_err(error)?;
+            let done = match upstream {
+                Ok(mut x) => {
+                    println!("{addr} -> {orig_dst} connected");
+                    copy_bidirectional(&mut tcpstream, &mut x).await
+                }
+                Err(e) => {
+                    println!("{addr} -> {orig_dst} failed: {e}");
+                    return;
+                }
+            };
 
-            println!("{addr} -> {orig_dst} disconnected");
-            Ok::<_, ()>(())
+            match done {
+                Ok((tx, rx)) => {
+                    println!("{addr} -> {orig_dst} done: {tx} byte sent, {rx} byte received")
+                }
+                Err(e) => println!("{addr} -> {orig_dst} error: {e}"),
+            }
         });
     }
 }
